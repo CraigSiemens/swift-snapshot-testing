@@ -271,6 +271,91 @@ final class SnapshotTestingTests: BaseTestCase {
     #endif
   }
 
+  func testImageDiffWithDifferentPixelFormats() throws {
+    #if os(iOS) || os(tvOS)
+      let width = 100
+      let height = 100
+      let pixelCount = width * height
+      let rgbaColorSpace = try XCTUnwrap(CGColorSpace(name: CGColorSpace.sRGB))
+      let rgbaData = Data(repeating: 255, count: pixelCount * 4)
+      let rgbaProvider = try XCTUnwrap(CGDataProvider(data: rgbaData as CFData))
+      let rgbaCgImage = try XCTUnwrap(
+        CGImage(
+          width: width,
+          height: height,
+          bitsPerComponent: 8,
+          bitsPerPixel: 32,
+          bytesPerRow: width * 4,
+          space: rgbaColorSpace,
+          bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+          provider: rgbaProvider,
+          decode: nil,
+          shouldInterpolate: false,
+          intent: .defaultIntent
+        )
+      )
+      
+      var grayscaleAlphaBytes = [UInt8](repeating: 0, count: pixelCount * 2)
+      for alphaIndex in stride(from: 1, to: grayscaleAlphaBytes.count, by: 2) {
+        grayscaleAlphaBytes[alphaIndex] = 127
+      }
+      let grayscaleAlphaData = Data(grayscaleAlphaBytes)
+      let grayscaleAlphaProvider = try XCTUnwrap(
+        CGDataProvider(data: grayscaleAlphaData as CFData)
+      )
+      let grayscaleAlphaCgImage = try XCTUnwrap(
+        CGImage(
+          width: width,
+          height: height,
+          bitsPerComponent: 8,
+          bitsPerPixel: 16,
+          bytesPerRow: width * 2,
+          space: CGColorSpaceCreateDeviceGray(),
+          bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+          provider: grayscaleAlphaProvider,
+          decode: nil,
+          shouldInterpolate: false,
+          intent: .defaultIntent
+        )
+      )
+      
+      let rgbaImage = UIImage(cgImage: rgbaCgImage)
+      let grayscaleAlphaImage = UIImage(cgImage: grayscaleAlphaCgImage)
+      let roundTrippedGrayscaleAlphaImage = try XCTUnwrap(
+        UIImage(data: try XCTUnwrap(grayscaleAlphaImage.pngData()))
+      )
+      XCTAssertEqual(rgbaImage.cgImage?.bitsPerPixel, 32)
+      XCTAssertEqual(roundTrippedGrayscaleAlphaImage.cgImage?.bitsPerPixel, 16)
+      
+      let difference = Diffing<UIImage>.image.diffV2(rgbaImage, grayscaleAlphaImage)
+
+      XCTAssertEqual(difference?.0, "Newly-taken snapshot does not match reference.")
+      XCTAssertEqual(difference?.1.count, 3)
+    #endif
+  }
+
+  func testImageDiffWithDifferentColorSpaces() throws {
+    #if os(iOS) || os(tvOS)
+      let size = CGSize(width: 100, height: 100)
+      let renderer = UIGraphicsImageRenderer(size: size)
+      
+      func snapshot(of color: UIColor) -> UIImage {
+        renderer.image { context in
+          color.setFill()
+          context.fill(.init(origin: .zero, size: size))
+        }
+      }
+      
+      let greyscaleSnapshot = snapshot(of: .white)
+      let rgbSnapshot = snapshot(of: .red)
+      
+      let difference = Diffing<UIImage>.image.diffV2(greyscaleSnapshot, rgbSnapshot)
+
+      XCTAssertEqual(difference?.0, "Newly-taken snapshot does not match reference.")
+      XCTAssertEqual(difference?.1.count, 3)
+    #endif
+  }
+  
   func testSCNView() {
     // #if os(iOS) || os(macOS) || os(tvOS)
     // // NB: CircleCI crashes while trying to instantiate SCNView.

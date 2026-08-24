@@ -16,7 +16,8 @@ test-ios:
 	set -o pipefail && \
 	xcodebuild test \
 		-scheme SnapshotTesting \
-		-destination platform="iOS Simulator,name=iPhone 11 Pro Max,OS=13.3"
+		-destination platform="iOS Simulator,name=iPhone 11 Pro Max,OS=13.3" \
+		-enableAddressSanitizer YES
 
 test-swift:
 	swift test
