@@ -30,11 +30,12 @@
         toData: toData,
         fromData: { UIImage(data: $0, scale: imageScale)! }
       ) { old, new in
+        let imageComparison = ImageComparisonContext(old: old, new: new)
         guard
           let message = compare(
-            old, new, precision: precision, perceptualPrecision: perceptualPrecision)
+            imageComparison, precision: precision, perceptualPrecision: perceptualPrecision)
         else { return nil }
-        let difference = SnapshotTesting.diff(old, new)
+        let difference = SnapshotTesting.diff(imageComparison)
         let isEmptyImage = new.size == .zero
         let referenceAttachment = DiffAttachment.data(toData(old), name: "reference.png")
         let failureAttachment = DiffAttachment.data(
@@ -92,51 +93,172 @@
   private let imageContextBitsPerComponent = 8
   private let imageContextBytesPerPixel = 4
 
-  private func compare(_ old: UIImage, _ new: UIImage, precision: Float, perceptualPrecision: Float)
-    -> String?
+  private struct ImageComparisonContext {
+    enum Comparability {
+      case comparable(PixelComparableImagePair)
+      case incomparable(String)
+    }
+
+    let old: UIImage
+    let new: UIImage
+    let comparability: Comparability
+
+    init(old: UIImage, new: UIImage) {
+      self.old = old
+      self.new = new
+      guard let oldCgImage = old.cgImage else {
+        self.comparability = .incomparable("Reference image could not be loaded.")
+        return
+      }
+      guard let newCgImage = new.cgImage else {
+        self.comparability = .incomparable("Newly-taken snapshot could not be loaded.")
+        return
+      }
+      guard newCgImage.width != 0, newCgImage.height != 0 else {
+        self.comparability = .incomparable("Newly-taken snapshot is empty.")
+        return
+      }
+      guard
+        oldCgImage.width == newCgImage.width,
+        oldCgImage.height == newCgImage.height
+      else {
+        self.comparability = .incomparable(
+          "Newly-taken snapshot@\(newCgImage.width)x\(newCgImage.height) pixels does not match reference@\(oldCgImage.width)x\(oldCgImage.height) pixels."
+        )
+        return
+      }
+      self.comparability = .comparable(
+        PixelComparableImagePair(
+          oldCgImage: oldCgImage,
+          newCgImage: newCgImage
+        )
+      )
+    }
+  }
+
+  private final class PixelComparableImagePair {
+    let oldCgImage: CGImage
+    let newCgImage: CGImage
+    var width: Int { self.oldCgImage.width }
+    var height: Int { self.oldCgImage.height }
+
+    private(set) lazy var oldBytes: [UInt8]? = {
+      var bytes: [UInt8]?
+      _ = Self.render(self.oldCgImage, into: &bytes)
+      return bytes
+    }()
+    private(set) lazy var newBytes: [UInt8]? = {
+      var bytes: [UInt8]?
+      _ = Self.render(self.newCgImage, into: &bytes)
+      return bytes
+    }()
+
+    init(oldCgImage: CGImage, newCgImage: CGImage) {
+      self.oldCgImage = oldCgImage
+      self.newCgImage = newCgImage
+    }
+
+    func bytesMatch() -> Bool? {
+      guard
+        let oldBytes = self.oldBytes,
+        let newBytes = self.newBytes
+      else { return nil }
+      return oldBytes.withUnsafeBytes { oldBytes in
+        newBytes.withUnsafeBytes { newBytes in
+          memcmp(oldBytes.baseAddress, newBytes.baseAddress, oldBytes.count) == 0
+        }
+      }
+    }
+
+    func renderPngEncodedNewImage(_ new: UIImage) -> Bool {
+      guard
+        let pngData = new.pngData(),
+        let newCgImage = UIImage(data: pngData)?.cgImage,
+        newCgImage.width == self.width,
+        newCgImage.height == self.height
+      else {
+        self.newBytes = nil
+        return false
+      }
+
+      return Self.render(newCgImage, into: &self.newBytes)
+    }
+    
+    private static func render(_ cgImage: CGImage, into bytes: inout [UInt8]?) -> Bool {
+      guard let colorSpace = imageContextColorSpace else {
+        bytes = nil
+        return false
+      }
+
+      let byteCount = imageContextBytesPerPixel * cgImage.width * cgImage.height
+      if bytes?.count != byteCount {
+        bytes = [UInt8](repeating: 0, count: byteCount)
+      }
+      let rendered = bytes!.withUnsafeMutableBytes { bytes in
+        guard
+          let context = CGContext(
+            data: bytes.baseAddress,
+            width: cgImage.width,
+            height: cgImage.height,
+            bitsPerComponent: imageContextBitsPerComponent,
+            bytesPerRow: cgImage.width * imageContextBytesPerPixel,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+          )
+        else { return false }
+
+        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: cgImage.width, height: cgImage.height))
+        return true
+      }
+      if !rendered {
+        bytes = nil
+      }
+      return rendered
+    }
+  }
+
+  private func compare(
+    _ imageComparison: ImageComparisonContext,
+    precision: Float,
+    perceptualPrecision: Float
+  ) -> String?
   {
-    guard let oldCgImage = old.cgImage else {
-      return "Reference image could not be loaded."
+    let imagePair: PixelComparableImagePair
+    switch imageComparison.comparability {
+    case let .comparable(comparableImagePair):
+      imagePair = comparableImagePair
+    case let .incomparable(message):
+      return message
     }
-    guard let newCgImage = new.cgImage else {
-      return "Newly-taken snapshot could not be loaded."
-    }
-    guard newCgImage.width != 0, newCgImage.height != 0 else {
-      return "Newly-taken snapshot is empty."
-    }
-    guard oldCgImage.width == newCgImage.width, oldCgImage.height == newCgImage.height else {
-      return "Newly-taken snapshot@\(new.size) does not match reference@\(old.size)."
-    }
-    let pixelCount = oldCgImage.width * oldCgImage.height
-    let byteCount = imageContextBytesPerPixel * pixelCount
-    var oldBytes = [UInt8](repeating: 0, count: byteCount)
-    guard let oldData = context(for: oldCgImage, data: &oldBytes)?.data else {
+    guard imagePair.oldBytes != nil else {
       return "Reference image's data could not be loaded."
     }
-    if let newContext = context(for: newCgImage), let newData = newContext.data {
-      if memcmp(oldData, newData, byteCount) == 0 { return nil }
-    }
-    var newerBytes = [UInt8](repeating: 0, count: byteCount)
-    guard
-      let pngData = new.pngData(),
-      let newerCgImage = UIImage(data: pngData)?.cgImage,
-      let newerContext = context(for: newerCgImage, data: &newerBytes),
-      let newerData = newerContext.data
-    else {
+    if imagePair.bytesMatch() == true { return nil }
+    guard imagePair.renderPngEncodedNewImage(imageComparison.new) else {
       return "Newly-taken snapshot's data could not be loaded."
     }
-    if memcmp(oldData, newerData, byteCount) == 0 { return nil }
+    if imagePair.bytesMatch() == true { return nil }
     if precision >= 1, perceptualPrecision >= 1 {
       return "Newly-taken snapshot does not match reference."
     }
     if perceptualPrecision < 1, #available(iOS 11.0, tvOS 11.0, *) {
-      return perceptuallyCompare(
-        CIImage(cgImage: oldCgImage),
-        CIImage(cgImage: newCgImage),
-        pixelPrecision: precision,
-        perceptualPrecision: perceptualPrecision
-      )
+      guard
+        let message = perceptuallyCompare(
+          CIImage(cgImage: imagePair.oldCgImage),
+          CIImage(cgImage: imagePair.newCgImage),
+          pixelPrecision: precision,
+          perceptualPrecision: perceptualPrecision
+        )
+      else { return nil }
+      return message
     } else {
+      guard
+        let oldBytes = imagePair.oldBytes,
+        let newBytes = imagePair.newBytes
+      else {
+        return "Newly-taken snapshot's data could not be loaded."
+      }
+      let byteCount = oldBytes.count
       let byteCountThreshold = Int((1 - precision) * Float(byteCount))
       var differentByteCount = 0
       // NB: We are purposely using a verbose 'while' loop instead of a 'for in' loop.  When the
@@ -146,7 +268,7 @@
       var index = 0
       while index < byteCount {
         defer { index += 1 }
-        if oldBytes[index] != newerBytes[index] {
+        if oldBytes[index] != newBytes[index] {
           differentByteCount += 1
         }
       }
@@ -158,28 +280,9 @@
     return nil
   }
 
-  private func context(for cgImage: CGImage, data: UnsafeMutableRawPointer? = nil) -> CGContext? {
-    let bytesPerRow = cgImage.width * imageContextBytesPerPixel
-    guard
-      let colorSpace = imageContextColorSpace,
-      let context = CGContext(
-        data: data,
-        width: cgImage.width,
-        height: cgImage.height,
-        bitsPerComponent: imageContextBitsPerComponent,
-        bytesPerRow: bytesPerRow,
-        space: colorSpace,
-        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-      )
-    else { return nil }
-
-    context.draw(cgImage, in: CGRect(x: 0, y: 0, width: cgImage.width, height: cgImage.height))
-    return context
-  }
-
-  private func diff(_ old: UIImage, _ new: UIImage) -> UIImage {
-    normalizedComponentDiff(old, new)
-    ?? blendModeDiff(old, new)
+  private func diff(_ imageComparison: ImageComparisonContext) -> UIImage {
+    normalizedComponentDiff(imageComparison)
+    ?? blendModeDiff(imageComparison.old, imageComparison.new)
   }
 
   private func blendModeDiff(_ old: UIImage, _ new: UIImage) -> UIImage {
@@ -194,18 +297,14 @@
     return differenceImage
   }
 
-private func normalizedComponentDiff(_ old: UIImage, _ new: UIImage) -> UIImage? {
-  guard let oldCgImage = old.cgImage,
-        let pngData = new.pngData(),
-        let newCgImage = UIImage(data: pngData)?.cgImage,
-        oldCgImage.width == newCgImage.width,
-        oldCgImage.height == newCgImage.height,
-        let oldData = oldCgImage.dataProvider?.data,
-        let newData = newCgImage.dataProvider?.data
-  else {
-    return nil
-  }
-  
+private func normalizedComponentDiff(_ imageComparison: ImageComparisonContext) -> UIImage? {
+  guard
+    case let .comparable(imagePair) = imageComparison.comparability,
+    let oldBytes = imagePair.oldBytes,
+    let newBytes = imagePair.newBytes
+  else { return nil }
+  let width = imagePair.width
+  let height = imagePair.height
   guard let outputColorSpace = CGColorSpace(name: CGColorSpace.linearGray),
         let outputFormat = vImage_CGImageFormat(
           bitsPerComponent: imageContextBitsPerComponent,
@@ -217,13 +316,12 @@ private func normalizedComponentDiff(_ old: UIImage, _ new: UIImage) -> UIImage?
     return nil
   }
   
-  let width = oldCgImage.width
-  let height = oldCgImage.height
   let pixelCount = width * height
-  let scale = old.scale
+  let byteCount = pixelCount * imageContextBytesPerPixel
+  guard oldBytes.count == byteCount, newBytes.count == byteCount else {
+    return nil
+  }
   
-  let oldBytes = CFDataGetBytePtr(oldData)!
-  let newBytes = CFDataGetBytePtr(newData)!
   var diffBytes = [UInt8](repeating: 0, count: pixelCount)
   
   var index = 0
@@ -282,7 +380,7 @@ private func normalizedComponentDiff(_ old: UIImage, _ new: UIImage) -> UIImage?
   
   guard let outputCgImage else { return nil }
   
-  return UIImage(cgImage: outputCgImage, scale: scale, orientation: .up)
+  return UIImage(cgImage: outputCgImage, scale: imageComparison.old.scale, orientation: .up)
 }
 #endif
 
